@@ -32,9 +32,9 @@ if (-not (Test-Administrator)) {
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $tcpdump = Join-Path $scriptDir 'tcpdump.exe'
 $tempDir = [IO.Path]::GetTempPath()
-$linkData = Join-Path $tempDir 'LinkData.txt'
 $saveData = Join-Path $tempDir 'SaveData.txt'
 $dataOut  = Join-Path $tempDir 'Data_Out.txt'
+$script:activeTcpdumpProcess = $null
 
 if (-not (Test-Path $tcpdump)) {
     [System.Windows.Forms.MessageBox]::Show(
@@ -76,6 +76,54 @@ function New-Label($parent, [string]$text, [int]$x, [int]$y, [int]$w, [int]$h = 
     return $l
 }
 
+function New-ValueBox($parent, [int]$x, [int]$y, [int]$w, [int]$h = 22) {
+    $t = New-Object Windows.Forms.TextBox
+    $t.Location = New-Object Drawing.Point($x,$y)
+    $t.Size = New-Object Drawing.Size($w,$h)
+    $t.ReadOnly = $true
+    $t.BorderStyle = [Windows.Forms.BorderStyle]::FixedSingle
+    $t.BackColor = [Drawing.SystemColors]::Window
+    if ($h -gt 22) {
+        $t.Multiline = $true
+        $t.ScrollBars = [Windows.Forms.ScrollBars]::Vertical
+    }
+    $parent.Controls.Add($t)
+    return $t
+}
+
+function Get-ValueAfterLastColon([string]$line) {
+    $index = $line.LastIndexOf(':')
+    if ($index -lt 0 -or $index + 1 -ge $line.Length) { return '' }
+
+    return $line.Substring($index + 1).Trim()
+}
+
+function Get-IPv4Address([string]$line) {
+    if ($line -match '\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b') {
+        return $matches[0]
+    }
+
+    return ''
+}
+
+function Get-TcpdumpDevice([string]$settingId) {
+    $escapedSettingId = [regex]::Escape($settingId)
+
+    try {
+        $interfaces = & $tcpdump -D 2>$null
+        foreach ($line in $interfaces) {
+            if ($line -match $escapedSettingId -and $line -match '^\d+\.(?<device>\\Device\\[^\s]+)') {
+                return $matches.device
+            }
+        }
+    }
+    catch {
+        # Fall back to the common Npcap/WinPcap naming convention below.
+    }
+
+    return "\Device\NPF_$settingId"
+}
+
 function Parse-LinkData([string[]]$lines) {
     $r = [ordered]@{
         SwitchName  = ''
@@ -98,11 +146,16 @@ function Parse-LinkData([string[]]$lines) {
             if ($line -match "'([^']*)'") { $r.SwitchPort = $matches[1].Trim() }
         }
         elseif ($line -like '*VLAN ID (0x0a)*') {
-            $p = $line.Split(':')
-            if ($p.Count -ge 3) { $r.VLAN = $p[2].Trim() }
+            $r.VLAN = Get-ValueAfterLastColon $line
         }
         elseif ($line -like '*Address (0x02)*') {
-            if ($line -match '\)\s*(.*)$') { $r.SwitchIP = $matches[1].Trim() }
+            $ipAddress = Get-IPv4Address $line
+            if ($ipAddress) {
+                $r.SwitchIP = $ipAddress
+            }
+            else {
+                $r.SwitchIP = Get-ValueAfterLastColon $line
+            }
         }
         elseif ($line -like '*Platform (0x06)*') {
             if ($line -match "'([^']*)'") {
@@ -111,10 +164,8 @@ function Parse-LinkData([string[]]$lines) {
             }
         }
         elseif ($line -like '*Duplex (0x0b)*') {
-            $p = $line.Split(':')
-            if ($p.Count -ge 3) {
-                $r.Duplex = (Get-Culture).TextInfo.ToTitleCase($p[2].Trim().ToLowerInvariant())
-            }
+            $duplex = Get-ValueAfterLastColon $line
+            if ($duplex) { $r.Duplex = (Get-Culture).TextInfo.ToTitleCase($duplex.ToLowerInvariant()) }
         }
         elseif ($line -like '*VTP Management Domain (0x09)*') {
             if ($line -match "'([^']*)'") { $r.VTP = $matches[1].Trim() }
@@ -191,8 +242,26 @@ function Clear-Results {
     $status.Text = ''
 }
 
-function Stop-Tcpdump {
-    Get-Process tcpdump -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+function Stop-Tcpdump([Diagnostics.Process]$process = $script:activeTcpdumpProcess) {
+    if (-not $process) { return }
+
+    try {
+        if (-not $process.HasExited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
+    }
+    catch {
+        $statusMessage = $_.Exception.Message
+        if (Get-Variable -Name status -Scope Script -ErrorAction SilentlyContinue) {
+            $status.Text = "Unable to stop tcpdump: $statusMessage"
+        }
+    }
+    finally {
+        if ($script:activeTcpdumpProcess -and $script:activeTcpdumpProcess.Id -eq $process.Id) {
+            $script:activeTcpdumpProcess = $null
+        }
+    }
 }
 
 function Get-LinkData($adapter) {
@@ -218,9 +287,9 @@ function Get-LinkData($adapter) {
         #   0x88cc = LLDP
         #   0x2000 = Cisco CDP
         #
-        # SettingID is the adapter GUID used by WinPcap/Npcap tcpdump as
-        # \Device\{GUID}.
-        $device = "\Device\$($adapter.SettingID)"
+        # Resolve the adapter GUID through tcpdump -D when possible because
+        # Npcap commonly exposes interfaces as \Device\NPF_{GUID}.
+        $device = Get-TcpdumpDevice $adapter.SettingID
         $arguments = "-i `"$device`" -nn -v -s 1500 -c 1 `"(ether[12:2]==0x88cc or ether[20:2]==0x2000)`""
 
         $psi = New-Object Diagnostics.ProcessStartInfo
@@ -234,6 +303,7 @@ function Get-LinkData($adapter) {
         $proc = New-Object Diagnostics.Process
         $proc.StartInfo = $psi
         [void]$proc.Start()
+        $script:activeTcpdumpProcess = $proc
 
         $sw = [Diagnostics.Stopwatch]::StartNew()
         while (-not $proc.HasExited -and $sw.Elapsed.TotalSeconds -lt 60) {
@@ -244,8 +314,7 @@ function Get-LinkData($adapter) {
         }
 
         if (-not $proc.HasExited) {
-            $proc.Kill()
-            $proc.WaitForExit()
+            Stop-Tcpdump $proc
         }
 
         $stdout = $proc.StandardOutput.ReadToEnd()
@@ -253,6 +322,11 @@ function Get-LinkData($adapter) {
         $stdout | Set-Content -LiteralPath $dataOut -Encoding Default
 
         if (-not $stdout.Trim()) {
+            if ($stderr.Trim()) {
+                $status.Text = "tcpdump error: $($stderr.Trim())"
+                return
+            }
+
             $status.Text = 'NO LINK DATA FOUND ... !'
             return
         }
@@ -260,7 +334,12 @@ function Get-LinkData($adapter) {
         $result = Parse-LinkData ($stdout -split "`r?`n")
 
         if (($result.PSObject.Properties.Value | Where-Object { $_ -and $_.ToString().Trim() }).Count -eq 0) {
-            $status.Text = 'NO LINK DATA FOUND ... !'
+            if ($stderr.Trim()) {
+                $status.Text = "No CDP/LLDP fields parsed. tcpdump said: $($stderr.Trim())"
+                return
+            }
+
+            $status.Text = 'No CDP/LLDP fields were parsed from tcpdump output.'
             return
         }
 
@@ -280,7 +359,7 @@ function Get-LinkData($adapter) {
         $status.Text = "Error: $($_.Exception.Message)"
     }
     finally {
-        Stop-Tcpdump
+        Stop-Tcpdump $proc
         $getButton.Enabled = $true
         $saveButton.Enabled = $true
         $helpButton.Enabled = $true
@@ -356,7 +435,7 @@ if ($adapters.Count -eq 0) {
 
 $form = New-Object Windows.Forms.Form
 $form.Text = 'Link Discovery for Windows - PowerShell'
-$form.Size = New-Object Drawing.Size(550, 455)
+$form.Size = New-Object Drawing.Size(760, 535)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
@@ -364,23 +443,23 @@ $form.MaximizeBox = $false
 $selection = New-Object Windows.Forms.GroupBox
 $selection.Text = 'Selection'
 $selection.Location = New-Object Drawing.Point(15,10)
-$selection.Size = New-Object Drawing.Size(505,133)
+$selection.Size = New-Object Drawing.Size(715,133)
 $form.Controls.Add($selection)
 
 New-Label $selection 'Network Connection:' 15 25 120
 $combo = New-Object Windows.Forms.ComboBox
 $combo.Location = New-Object Drawing.Point(130,23)
-$combo.Size = New-Object Drawing.Size(350,21)
+$combo.Size = New-Object Drawing.Size(560,21)
 $combo.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
 [void]$combo.Items.AddRange([object[]]($adapters.Name))
 $selection.Controls.Add($combo)
 
 New-Label $selection 'Network Card:' 15 52 100
-$lblHardware = New-Label $selection '' 130 50 350
+$lblHardware = New-Label $selection '' 130 50 560
 New-Label $selection 'MAC Address:' 15 79 100
 $lblMac = New-Label $selection '' 130 77 120
 New-Label $selection 'IP Address:' 255 79 100
-$lblIp = New-Label $selection '' 360 77 120
+$lblIp = New-Label $selection '' 360 77 160
 
 $getButton = New-Object Windows.Forms.Button
 $getButton.Text = 'Get Link Data'
@@ -409,39 +488,39 @@ $selection.Controls.Add($cancelButton)
 $results = New-Object Windows.Forms.GroupBox
 $results.Text = 'Results'
 $results.Location = New-Object Drawing.Point(15,153)
-$results.Size = New-Object Drawing.Size(505,160)
+$results.Size = New-Object Drawing.Size(715,230)
 $form.Controls.Add($results)
 
 New-Label $results 'Switch Name:' 15 25 100
-$lblSwitch = New-Label $results '' 125 23 350
+$lblSwitch = New-ValueBox $results 130 22 560
 
 New-Label $results 'Port Identifier:' 15 55 100
-$lblPort = New-Label $results '' 125 53 120
+$lblPort = New-ValueBox $results 130 52 560
 
 New-Label $results 'VLAN Identifier:' 15 85 100
-$lblVlan = New-Label $results '' 125 83 120
+$lblVlan = New-ValueBox $results 130 82 560
 
 New-Label $results 'Switch IP Address:' 15 115 110
-$lblIP = New-Label $results '' 125 113 120
+$lblIP = New-ValueBox $results 130 112 560
 
-New-Label $results 'Switch Model:' 255 55 100
-$lblModel = New-Label $results '' 350 53 140 35
+New-Label $results 'Switch Model:' 15 145 100
+$lblModel = New-ValueBox $results 130 142 560 45
 
-New-Label $results 'Port Duplex:' 255 85 100
-$lblDuplex = New-Label $results '' 350 83 140
+New-Label $results 'Port Duplex:' 15 195 100
+$lblDuplex = New-ValueBox $results 130 192 190
 
-New-Label $results 'VTP Mgmt Domain:' 255 115 100
-$lblVtp = New-Label $results '' 350 113 140
+New-Label $results 'VTP Mgmt Domain:' 360 195 110
+$lblVtp = New-ValueBox $results 475 192 215
 
 $statusGroup = New-Object Windows.Forms.GroupBox
 $statusGroup.Text = 'Status'
-$statusGroup.Location = New-Object Drawing.Point(15,323)
-$statusGroup.Size = New-Object Drawing.Size(505,65)
+$statusGroup.Location = New-Object Drawing.Point(15,393)
+$statusGroup.Size = New-Object Drawing.Size(715,65)
 $form.Controls.Add($statusGroup)
 
-$status = New-Label $statusGroup '' 15 23 470
+$status = New-Label $statusGroup '' 15 23 680
 
-$version = New-Label $form 'LDWin - PowerShell Port - v2.2' 315 395 205
+$version = New-Label $form 'LDWin - PowerShell Port - v2.2' 525 465 205
 $version.TextAlign = [Windows.Forms.HorizontalAlignment]::Right
 
 $combo.Add_SelectedIndexChanged({
@@ -481,4 +560,4 @@ $combo.SelectedIndex = 0
 
 # Cleanup.
 Stop-Tcpdump
-Remove-Item $linkData, $saveData, $dataOut -Force -ErrorAction SilentlyContinue
+Remove-Item $saveData, $dataOut -Force -ErrorAction SilentlyContinue
