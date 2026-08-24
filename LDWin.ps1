@@ -328,6 +328,14 @@ function Parse-LinkData([string[]]$lines) {
             $value = Get-TlvValue $lines $i
             if ($value) { $r.SwitchModel = $value }
         }
+        elseif ($line -like '*PMD autoneg capability*' -or $line -like '*MAU type*') {
+            if ($line -match '\b(fdx|full[-\s]?duplex)\b') {
+                $r.Duplex = 'Full'
+            }
+            elseif ($line -match '\b(hdx|half[-\s]?duplex)\b') {
+                $r.Duplex = 'Half'
+            }
+        }
     }
 
     return [pscustomobject]$r
@@ -599,21 +607,21 @@ $selection.Location = New-Object Drawing.Point(15,10)
 $selection.Size = New-Object Drawing.Size(715,133)
 $form.Controls.Add($selection)
 
-[void](New-Label $selection 'Network Connection' 15 25 140)
+[void](New-Label $selection 'Network Connection' 15 25 155)
 $combo = New-Object Windows.Forms.ComboBox
-$combo.Location = New-Object Drawing.Point(165,23)
-$combo.Size = New-Object Drawing.Size(525,21)
+$combo.Location = New-Object Drawing.Point(180,23)
+$combo.Size = New-Object Drawing.Size(510,21)
 $combo.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
 $combo.DisplayMember = 'DisplayName'
 [void]$combo.Items.AddRange([object[]]$adapters)
 $selection.Controls.Add($combo)
 
-[void](New-Label $selection 'Network Card' 15 52 140)
-$txtAdapterHardware = New-Label $selection '' 165 50 525
-[void](New-Label $selection 'MAC Address' 15 79 140)
-$txtAdapterMac = New-Label $selection '' 165 77 140
-[void](New-Label $selection 'IP Address' 345 79 90)
-$txtAdapterIp = New-Label $selection '' 445 77 180
+[void](New-Label $selection 'Network Card' 15 52 155)
+$txtAdapterHardware = New-Label $selection '' 180 50 510
+[void](New-Label $selection 'MAC Address' 15 79 155)
+$txtAdapterMac = New-Label $selection '' 180 77 140
+[void](New-Label $selection 'IP Address' 350 79 90)
+$txtAdapterIp = New-Label $selection '' 450 77 180
 
 $getButton = New-Object Windows.Forms.Button
 $getButton.Text = 'Get Link Data'
