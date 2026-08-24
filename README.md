@@ -5,7 +5,7 @@ Een port van de originele LDWin.au3 naar Powershell. ([LDWin van Chris Hall op G
 Diverse aanpassingen en verbeteringen in het parsen van de data en de opzet van de GUI.
 
 
-<img width="746" height="527" alt="image" src="https://github.com/user-attachments/assets/6af985a2-d35b-47d1-ad8c-49e91ad532e1" />
+<img width="746" height="527" alt="image" src="assets/ldwin-screenshot.png" />
 
 
 ### Wat doet het
