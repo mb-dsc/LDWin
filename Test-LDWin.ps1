@@ -44,7 +44,7 @@ if (Test-Path -LiteralPath $tcpdumpPath) {
     }
 }
 
-$functionNames = @('Get-ValueAfterLastColon', 'Get-IPv4Address', 'Parse-LinkData')
+$functionNames = @('Get-ValueAfterLastColon', 'Get-IPv4Address', 'Get-TlvValue', 'Get-PacketCaptureDriverProblem', 'Get-FriendlyTcpdumpError', 'Get-AdapterIPAddress', 'Get-NetworkAdapters', 'Parse-LinkData')
 foreach ($functionName in $functionNames) {
     $functionAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName }, $true)
     if ($functionAst) {
@@ -52,6 +52,21 @@ foreach ($functionName in $functionNames) {
     }
 
     $results.Add((Add-Result "$functionName found" ($null -ne $functionAst)))
+}
+
+if (Get-Command Get-NetworkAdapters -ErrorAction SilentlyContinue) {
+    $adapters = @(Get-NetworkAdapters)
+    $adaptersWithIP = @($adapters | Where-Object { $_.IPAddress })
+    $upAdapters = @($adapters | Where-Object { $_.LinkStatus -eq 'Up' })
+    $adapterDetails = ($adapters | ForEach-Object { "$($_.Name)=$($_.IPAddress),$($_.LinkStatus)" }) -join ' | '
+    $results.Add((Add-Result 'Network adapters enumerated' ($adapters.Count -gt 0) $adapterDetails))
+    $results.Add((Add-Result 'Adapters with IP detected' ($adaptersWithIP.Count -gt 0) "$($adaptersWithIP.Count) of $($adapters.Count) adapters have IPv4 addresses"))
+    $results.Add((Add-Result 'Adapter link status detected' ($upAdapters.Count -gt 0) "$($upAdapters.Count) of $($adapters.Count) adapters are Up"))
+}
+
+if (Get-Command Get-PacketCaptureDriverProblem -ErrorAction SilentlyContinue) {
+    $driverProblem = Get-PacketCaptureDriverProblem
+    $results.Add((Add-Result 'Packet capture driver ready' (-not $driverProblem) $driverProblem))
 }
 
 if (Get-Command Parse-LinkData -ErrorAction SilentlyContinue) {
@@ -88,6 +103,24 @@ if (Get-Command Parse-LinkData -ErrorAction SilentlyContinue) {
         $lldp.SwitchIP -eq '10.0.0.1' -and
         $lldp.SwitchModel -eq 'Cisco IOS Software, C9300'
     $results.Add((Add-Result 'LLDP parser sample' $lldpOk ($lldp | ConvertTo-Json -Compress)))
+
+    $unifiLldpSample = @(
+        '12:00:00.000000 LLDP, length 198',
+        '    Chassis ID TLV (1), length 7',
+        '      Subtype MAC address (4): 78:45:58:11:22:33',
+        '    Port ID TLV (2), length 17',
+        '      Subtype Interface Name (5): Docking Station',
+        '    Time to Live TLV (3), length 2: TTL 120s',
+        '    System Name TLV (5), length 17: SW03-MITCHELKAMER',
+        '    System Description TLV (6), length 32: US-8, 7.4.1.16850, Linux 3.6.5',
+        '    Management Address TLV (8), length 12: IPv4 192.168.51.1'
+    )
+    $unifi = Parse-LinkData $unifiLldpSample
+    $unifiOk = $unifi.SwitchName -eq 'SW03-MITCHELKAMER' -and
+        $unifi.SwitchPort -eq 'Docking Station' -and
+        $unifi.SwitchIP -eq '192.168.51.1' -and
+        $unifi.SwitchModel -eq 'US-8, 7.4.1.16850, Linux 3.6.5'
+    $results.Add((Add-Result 'UniFi LLDP parser sample' $unifiOk ($unifi | ConvertTo-Json -Compress)))
 }
 
 $results | Format-Table -AutoSize

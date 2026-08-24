@@ -47,22 +47,59 @@ if (-not (Test-Path $tcpdump)) {
 }
 
 function Get-NetworkAdapters {
-    # Equivalent to the original WMI enumeration of Win32_NetworkAdapter and
-    # Win32_NetworkAdapterConfiguration.
-    $adapters = Get-CimInstance Win32_NetworkAdapter |
-        Where-Object { $_.NetConnectionID }
+    $adapterConfigurations = @(Get-CimInstance Win32_NetworkAdapterConfiguration)
+
+    try {
+        $netAdapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Name })
+        foreach ($a in $netAdapters) {
+            $cfg = $adapterConfigurations |
+                Where-Object {
+                    $_.SettingID -eq $a.InterfaceGuid.Guid -or
+                    $_.InterfaceIndex -eq $a.InterfaceIndex -or
+                    $_.Description -eq $a.InterfaceDescription
+                } |
+                Select-Object -First 1
+            $ipAddress = Get-AdapterIPAddress $cfg $a.Name $a.InterfaceIndex
+
+            [pscustomobject]@{
+                Name        = $a.Name
+                DisplayName = $a.Name
+                ProductName = $a.InterfaceDescription
+                SettingID   = if ($cfg -and $cfg.SettingID) { $cfg.SettingID } else { $a.InterfaceGuid.Guid }
+                IPAddress   = $ipAddress
+                MACAddress  = if ($a.MacAddress) { $a.MacAddress.Replace('-', ':') } else { '' }
+                Index       = $a.InterfaceIndex
+                LinkStatus  = $a.Status
+            }
+        }
+
+        return
+    }
+    catch {
+        # Fall back to Win32_NetworkAdapter below for older systems.
+    }
+
+    $adapters = Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.NetConnectionID }
 
     foreach ($a in $adapters) {
-        $cfg = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "Index=$($a.Index)" |
+        $cfg = $adapterConfigurations |
+            Where-Object {
+                $_.SettingID -eq $a.GUID -or
+                $_.Index -eq $a.DeviceID -or
+                $_.InterfaceIndex -eq $a.InterfaceIndex
+            } |
             Select-Object -First 1
+        $ipAddress = Get-AdapterIPAddress $cfg $a.NetConnectionID $a.InterfaceIndex
 
         [pscustomobject]@{
             Name        = $a.NetConnectionID
+            DisplayName = $a.NetConnectionID
             ProductName = $a.ProductName
-            SettingID   = $cfg.SettingID
-            IPAddress   = if ($cfg.IPAddress) { $cfg.IPAddress[0] } else { '' }
+            SettingID   = if ($cfg -and $cfg.SettingID) { $cfg.SettingID } else { $a.GUID }
+            IPAddress   = $ipAddress
             MACAddress  = $a.MACAddress
             Index       = $a.Index
+            LinkStatus  = if ($a.NetConnectionStatus -eq 2) { 'Up' } else { 'Disconnected' }
         }
     }
 }
@@ -106,6 +143,24 @@ function Get-IPv4Address([string]$line) {
     return ''
 }
 
+function Get-TlvValue([string[]]$lines, [int]$index) {
+    $line = $lines[$index]
+    $value = Get-ValueAfterLastColon $line
+    if ($value -and $value -notmatch '^$|^length\s+\d+$') { return $value }
+
+    for ($offset = 1; $offset -le 3 -and ($index + $offset) -lt $lines.Count; $offset++) {
+        $nextLine = $lines[$index + $offset].Trim()
+        if (-not $nextLine) { continue }
+
+        $nextValue = Get-ValueAfterLastColon $nextLine
+        if ($nextValue) { return $nextValue }
+
+        return $nextLine
+    }
+
+    return ''
+}
+
 function Get-TcpdumpDevice([string]$settingId) {
     $escapedSettingId = [regex]::Escape($settingId)
 
@@ -122,6 +177,73 @@ function Get-TcpdumpDevice([string]$settingId) {
     }
 
     return "\Device\NPF_$settingId"
+}
+
+function Get-PacketCaptureDriverProblem {
+    $drivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -in @('npcap', 'npf') })
+
+    if ($drivers.Count -eq 0) {
+        return 'Npcap/WinPcap packet driver was not found. Install or repair Npcap, then restart LDWin.'
+    }
+
+    $disabledDriver = $drivers | Where-Object { $_.StartMode -eq 'Disabled' } | Select-Object -First 1
+    if ($disabledDriver) {
+        return "Packet driver '$($disabledDriver.Name)' is disabled. Enable or repair Npcap, then restart LDWin."
+    }
+
+    $runningDriver = $drivers | Where-Object { $_.State -eq 'Running' } | Select-Object -First 1
+    if (-not $runningDriver) {
+        return 'Npcap/WinPcap packet driver is installed but not running. Start the Npcap service or reboot Windows.'
+    }
+
+    return ''
+}
+
+function Get-FriendlyTcpdumpError([string]$stderr) {
+    if ($stderr -match 'marked for deletion') {
+        return 'Npcap/WinPcap driver is marked for deletion. Reboot Windows, then run LDWin again. If it persists, repair or reinstall Npcap.'
+    }
+
+    if ($stderr -match 'service cannot be started|1058|NPF Failed') {
+        return 'Npcap/WinPcap driver cannot be started. Check that Npcap is installed, enabled, and running; a reboot or Npcap repair may be required.'
+    }
+
+    return $stderr.Trim()
+}
+
+function Get-AdapterIPAddress($adapterConfiguration, [string]$interfaceAlias, [int]$interfaceIndex = 0) {
+    try {
+        $ipAddresses = @()
+        if ($interfaceIndex -gt 0) {
+            $ipAddresses += @(Get-NetIPAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+        }
+
+        if ($interfaceAlias) {
+            $ipAddresses += @(Get-NetIPAddress -InterfaceAlias $interfaceAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+        }
+
+        $ipv4Address = $ipAddresses |
+            Where-Object { $_.IPAddress -and $_.IPAddress -notlike '169.254.*' } |
+            Select-Object -ExpandProperty IPAddress -First 1
+
+        if ($ipv4Address) { return $ipv4Address }
+    }
+    catch {
+        # Fall back to Win32_NetworkAdapterConfiguration below.
+    }
+
+    if ($adapterConfiguration -and $adapterConfiguration.IPAddress) {
+        $ipv4Address = $adapterConfiguration.IPAddress |
+            Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -notlike '169.254.*' } |
+            Select-Object -First 1
+
+        if ($ipv4Address) { return $ipv4Address }
+
+        return ($adapterConfiguration.IPAddress | Select-Object -First 1)
+    }
+
+    return ''
 }
 
 function Parse-LinkData([string[]]$lines) {
@@ -172,53 +294,39 @@ function Parse-LinkData([string[]]$lines) {
         }
 
         # LLDP
-        elseif ($line -like '*System Name TLV (5)*') {
-            $p = $line.Split(':',2)
-            if ($p.Count -eq 2) { $r.SwitchName = $p[1].Trim().ToUpperInvariant() }
+        elseif ($line -like '*System Name TLV (5)*' -or $line -match '\bsystem\s+name\b') {
+            $value = Get-TlvValue $lines $i
+            if ($value) { $r.SwitchName = $value.ToUpperInvariant() }
         }
         elseif ($line -like '*Chassis ID TLV (1)*') {
-            $p = $line.Split(':',2)
-            if ($p.Count -eq 2 -and $p[1].Trim()) {
-                $r.SwitchName = $p[1].Trim()
-            }
-            elseif ($i + 1 -lt $lines.Count) {
-                $r.SwitchName = $lines[$i+1].Split(':',2)[-1].Trim()
-            }
+            $value = Get-TlvValue $lines $i
+            if ($value -and -not $r.SwitchName) { $r.SwitchName = $value }
         }
         elseif ($line -like '*Port ID TLV (2)*') {
-            $p = $line.Split(':',2)
-            if ($p.Count -eq 2 -and $p[1].Trim()) {
-                $r.SwitchPort = $p[1].Trim()
-            }
-            elseif ($i + 1 -lt $lines.Count) {
-                $r.SwitchPort = $lines[$i+1].Split(':',2)[-1].Trim()
-            }
+            $value = Get-TlvValue $lines $i
+            if ($value) { $r.SwitchPort = $value }
         }
         elseif ($line -like '*Port Description TLV (4)*') {
-            $p = $line.Split(':',2)
-            if ($p.Count -eq 2) { $r.SwitchPort = $p[1].Trim() }
+            $value = Get-TlvValue $lines $i
+            if ($value) { $r.SwitchPort = $value }
         }
-        elseif ($line -like '*port vlan id (PVID)*') {
-            $p = $line.Split(':',2)
-            if ($p.Count -eq 2) { $r.VLAN = $p[1].Trim() }
+        elseif ($line -like '*port vlan id (PVID)*' -or $line -match '\bport\s+vlan\s+id\b') {
+            $value = Get-TlvValue $lines $i
+            if ($value) { $r.VLAN = $value }
         }
         elseif ($line -like '*Management Address TLV (8)*') {
-            $p = $line.Split(':',2)
-            if ($p.Count -eq 2 -and $p[1].Trim()) {
-                $r.SwitchIP = $p[1].Trim().ToUpperInvariant()
+            $value = Get-TlvValue $lines $i
+            $ipAddress = Get-IPv4Address $value
+            if ($ipAddress) {
+                $r.SwitchIP = $ipAddress
             }
-            elseif ($i + 1 -lt $lines.Count) {
-                $r.SwitchIP = $lines[$i+1].Split(':',2)[-1].Trim().ToUpperInvariant()
+            elseif ($value) {
+                $r.SwitchIP = $value.ToUpperInvariant()
             }
         }
         elseif ($line -like '*System Description TLV (6)*') {
-            $p = $line.Split(':',2)
-            if ($p.Count -eq 2 -and $p[1].Trim()) {
-                $r.SwitchModel = $p[1].Trim()
-            }
-            elseif ($i + 1 -lt $lines.Count) {
-                $r.SwitchModel = $lines[$i+1].Trim()
-            }
+            $value = Get-TlvValue $lines $i
+            if ($value) { $r.SwitchModel = $value }
         }
     }
 
@@ -229,7 +337,7 @@ function Set-ResultLabels($result) {
     $lblSwitch.Text = $result.SwitchName
     $lblPort.Text   = $result.SwitchPort
     $lblVlan.Text   = $result.VLAN
-    $lblIP.Text     = $result.SwitchIP
+    $txtSwitchIp.Text = $result.SwitchIP
     $lblModel.Text  = $result.SwitchModel
     $lblDuplex.Text = $result.Duplex
     $lblVtp.Text    = $result.VTP
@@ -242,20 +350,49 @@ function Clear-Results {
     $status.Text = ''
 }
 
+function Get-SelectedAdapter {
+    $selected = $combo.SelectedItem
+    if ($selected -and $selected.PSObject.Properties['IPAddress']) { return $selected }
+
+    return ($adapters | Where-Object {
+        $_.Name -eq $combo.Text -or $_.DisplayName -eq $combo.Text -or $_.Name -eq $selected
+    } | Select-Object -First 1)
+}
+
+function Update-SelectedAdapterDetails {
+    $selected = Get-SelectedAdapter
+    if (-not $selected) { return }
+
+    $txtAdapterHardware.Text = if ($selected.ProductName) { $selected.ProductName.ToString() } else { '' }
+    $txtAdapterMac.Text = if ($selected.MACAddress) { $selected.MACAddress.ToString() } else { '' }
+    $txtAdapterIp.Text = if ($selected.IPAddress) { $selected.IPAddress.ToString() } else { '' }
+    Clear-Results
+}
+
 function Stop-Tcpdump([Diagnostics.Process]$process = $script:activeTcpdumpProcess) {
-    if (-not $process) { return }
+    if (-not $process) { return $true }
 
     try {
         if (-not $process.HasExited) {
             $process.Kill()
-            $process.WaitForExit()
+            if (-not $process.WaitForExit(5000)) {
+                if (Get-Variable -Name status -Scope Script -ErrorAction SilentlyContinue) {
+                    $status.Text = 'tcpdump did not exit after timeout; capture was abandoned.'
+                }
+
+                return $false
+            }
         }
+
+        return $true
     }
     catch {
         $statusMessage = $_.Exception.Message
         if (Get-Variable -Name status -Scope Script -ErrorAction SilentlyContinue) {
             $status.Text = "Unable to stop tcpdump: $statusMessage"
         }
+
+        return $false
     }
     finally {
         if ($script:activeTcpdumpProcess -and $script:activeTcpdumpProcess.Id -eq $process.Id) {
@@ -266,6 +403,17 @@ function Stop-Tcpdump([Diagnostics.Process]$process = $script:activeTcpdumpProce
 
 function Get-LinkData($adapter) {
     Clear-Results
+
+    if ($adapter.LinkStatus -and $adapter.LinkStatus -ne 'Up') {
+        $status.Text = "Adapter '$($adapter.Name)' is $($adapter.LinkStatus). Connect the adapter before getting link data."
+        return
+    }
+
+    $driverProblem = Get-PacketCaptureDriverProblem
+    if ($driverProblem) {
+        $status.Text = $driverProblem
+        return
+    }
 
     Set-Content -LiteralPath $saveData -Value @(
         $adapter.Name
@@ -314,7 +462,12 @@ function Get-LinkData($adapter) {
         }
 
         if (-not $proc.HasExited) {
-            Stop-Tcpdump $proc
+            if (-not (Stop-Tcpdump $proc)) { return }
+        }
+
+        if (-not $proc.HasExited) {
+            $status.Text = 'tcpdump did not exit cleanly; no link data was collected.'
+            return
         }
 
         $stdout = $proc.StandardOutput.ReadToEnd()
@@ -323,7 +476,7 @@ function Get-LinkData($adapter) {
 
         if (-not $stdout.Trim()) {
             if ($stderr.Trim()) {
-                $status.Text = "tcpdump error: $($stderr.Trim())"
+                $status.Text = "tcpdump error: $(Get-FriendlyTcpdumpError $stderr)"
                 return
             }
 
@@ -335,11 +488,11 @@ function Get-LinkData($adapter) {
 
         if (($result.PSObject.Properties.Value | Where-Object { $_ -and $_.ToString().Trim() }).Count -eq 0) {
             if ($stderr.Trim()) {
-                $status.Text = "No CDP/LLDP fields parsed. tcpdump said: $($stderr.Trim())"
+                $status.Text = "No CDP/LLDP fields parsed. tcpdump said: $(Get-FriendlyTcpdumpError $stderr)"
                 return
             }
 
-            $status.Text = 'No CDP/LLDP fields were parsed from tcpdump output.'
+            $status.Text = "No CDP/LLDP fields parsed. Raw output saved to: $dataOut"
             return
         }
 
@@ -359,7 +512,7 @@ function Get-LinkData($adapter) {
         $status.Text = "Error: $($_.Exception.Message)"
     }
     finally {
-        Stop-Tcpdump $proc
+        [void](Stop-Tcpdump $proc)
         $getButton.Enabled = $true
         $saveButton.Enabled = $true
         $helpButton.Enabled = $true
@@ -446,43 +599,44 @@ $selection.Location = New-Object Drawing.Point(15,10)
 $selection.Size = New-Object Drawing.Size(715,133)
 $form.Controls.Add($selection)
 
-New-Label $selection 'Network Connection:' 15 25 120
+[void](New-Label $selection 'Network Connection' 15 25 140)
 $combo = New-Object Windows.Forms.ComboBox
-$combo.Location = New-Object Drawing.Point(130,23)
-$combo.Size = New-Object Drawing.Size(560,21)
+$combo.Location = New-Object Drawing.Point(165,23)
+$combo.Size = New-Object Drawing.Size(525,21)
 $combo.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
-[void]$combo.Items.AddRange([object[]]($adapters.Name))
+$combo.DisplayMember = 'DisplayName'
+[void]$combo.Items.AddRange([object[]]$adapters)
 $selection.Controls.Add($combo)
 
-New-Label $selection 'Network Card:' 15 52 100
-$lblHardware = New-Label $selection '' 130 50 560
-New-Label $selection 'MAC Address:' 15 79 100
-$lblMac = New-Label $selection '' 130 77 120
-New-Label $selection 'IP Address:' 255 79 100
-$lblIp = New-Label $selection '' 360 77 160
+[void](New-Label $selection 'Network Card' 15 52 140)
+$txtAdapterHardware = New-Label $selection '' 165 50 525
+[void](New-Label $selection 'MAC Address' 15 79 140)
+$txtAdapterMac = New-Label $selection '' 165 77 140
+[void](New-Label $selection 'IP Address' 345 79 90)
+$txtAdapterIp = New-Label $selection '' 445 77 180
 
 $getButton = New-Object Windows.Forms.Button
 $getButton.Text = 'Get Link Data'
-$getButton.Location = New-Object Drawing.Point(75,104)
-$getButton.Size = New-Object Drawing.Size(100,25)
+$getButton.Location = New-Object Drawing.Point(135,104)
+$getButton.Size = New-Object Drawing.Size(115,25)
 $selection.Controls.Add($getButton)
 
 $saveButton = New-Object Windows.Forms.Button
 $saveButton.Text = 'Save Link Data'
-$saveButton.Location = New-Object Drawing.Point(185,104)
-$saveButton.Size = New-Object Drawing.Size(100,25)
+$saveButton.Location = New-Object Drawing.Point(260,104)
+$saveButton.Size = New-Object Drawing.Size(115,25)
 $selection.Controls.Add($saveButton)
 
 $helpButton = New-Object Windows.Forms.Button
 $helpButton.Text = 'Help'
-$helpButton.Location = New-Object Drawing.Point(295,104)
+$helpButton.Location = New-Object Drawing.Point(385,104)
 $helpButton.Size = New-Object Drawing.Size(100,25)
 $selection.Controls.Add($helpButton)
 
 $cancelButton = New-Object Windows.Forms.Button
 $cancelButton.Text = 'Cancel'
-$cancelButton.Location = New-Object Drawing.Point(405,104)
-$cancelButton.Size = New-Object Drawing.Size(75,25)
+$cancelButton.Location = New-Object Drawing.Point(495,104)
+$cancelButton.Size = New-Object Drawing.Size(85,25)
 $selection.Controls.Add($cancelButton)
 
 $results = New-Object Windows.Forms.GroupBox
@@ -491,26 +645,26 @@ $results.Location = New-Object Drawing.Point(15,153)
 $results.Size = New-Object Drawing.Size(715,230)
 $form.Controls.Add($results)
 
-New-Label $results 'Switch Name:' 15 25 100
-$lblSwitch = New-ValueBox $results 130 22 560
+[void](New-Label $results 'Switch Name' 15 25 135)
+$lblSwitch = New-ValueBox $results 160 22 530
 
-New-Label $results 'Port Identifier:' 15 55 100
-$lblPort = New-ValueBox $results 130 52 560
+[void](New-Label $results 'Port Identifier' 15 55 135)
+$lblPort = New-ValueBox $results 160 52 530
 
-New-Label $results 'VLAN Identifier:' 15 85 100
-$lblVlan = New-ValueBox $results 130 82 560
+[void](New-Label $results 'VLAN Identifier' 15 85 135)
+$lblVlan = New-ValueBox $results 160 82 530
 
-New-Label $results 'Switch IP Address:' 15 115 110
-$lblIP = New-ValueBox $results 130 112 560
+[void](New-Label $results 'Switch IP Address' 15 115 135)
+$txtSwitchIp = New-ValueBox $results 160 112 530
 
-New-Label $results 'Switch Model:' 15 145 100
-$lblModel = New-ValueBox $results 130 142 560 45
+[void](New-Label $results 'Switch Model' 15 145 135)
+$lblModel = New-ValueBox $results 160 142 530 45
 
-New-Label $results 'Port Duplex:' 15 195 100
-$lblDuplex = New-ValueBox $results 130 192 190
+[void](New-Label $results 'Port Duplex' 15 195 135)
+$lblDuplex = New-ValueBox $results 160 192 180
 
-New-Label $results 'VTP Mgmt Domain:' 360 195 110
-$lblVtp = New-ValueBox $results 475 192 215
+[void](New-Label $results 'VTP Mgmt Domain' 355 195 140)
+$lblVtp = New-ValueBox $results 505 192 185
 
 $statusGroup = New-Object Windows.Forms.GroupBox
 $statusGroup.Text = 'Status'
@@ -523,15 +677,7 @@ $status = New-Label $statusGroup '' 15 23 680
 $version = New-Label $form 'LDWin - PowerShell Port - v2.2' 525 465 205
 $version.TextAlign = [Windows.Forms.HorizontalAlignment]::Right
 
-$combo.Add_SelectedIndexChanged({
-    $selected = $adapters | Where-Object Name -eq $combo.SelectedItem | Select-Object -First 1
-    if ($selected) {
-        $lblHardware.Text = $selected.ProductName
-        $lblMac.Text = $selected.MACAddress
-        $lblIp.Text = $selected.IPAddress
-        Clear-Results
-    }
-})
+$combo.Add_SelectedIndexChanged({ Update-SelectedAdapterDetails })
 
 $getButton.Add_Click({
     if (-not $combo.SelectedItem) {
@@ -544,20 +690,22 @@ $getButton.Add_Click({
         return
     }
 
-    $selected = $adapters | Where-Object Name -eq $combo.SelectedItem | Select-Object -First 1
+    $selected = Get-SelectedAdapter
+
     Get-LinkData $selected
 })
 
 $saveButton.Add_Click({ Save-LinkData })
 $helpButton.Add_Click({ Show-Help })
 $cancelButton.Add_Click({ $form.Close() })
-$form.Add_FormClosing({ Stop-Tcpdump })
+$form.Add_FormClosing({ [void](Stop-Tcpdump) })
 
 # Select first adapter just like a normal usable UI default.
 $combo.SelectedIndex = 0
+Update-SelectedAdapterDetails
 
 [void]$form.ShowDialog()
 
 # Cleanup.
-Stop-Tcpdump
+[void](Stop-Tcpdump)
 Remove-Item $saveData, $dataOut -Force -ErrorAction SilentlyContinue
