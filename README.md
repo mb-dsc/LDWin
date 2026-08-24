@@ -10,7 +10,7 @@ De CLI variant is opgezet voor Windows en Linux met `pwsh`
 
 ## Screenshot
 
-<img height="400" alt="ldwin screenshot" src="assets/ldwin-screenshot.png" />  <img height="400" alt="ldwin-cli screenshot" src="assets/ldwin-cli-screenshot.png" />
+<img width="500" alt="ldwin screenshot" src="assets/ldwin-screenshot.png" />  <img width="500" alt="ldwin-cli screenshot" src="assets/ldwin-cli-screenshot.png" />
 
 
 ## Wat doet het
@@ -40,6 +40,12 @@ NOTE: Je hebt geen valide TCP/IP adres nodig om valide link data te ontvangen.
 ### CLI versie
 
 Gebruik `LDWin-cli.ps1` als commandline variant. Deze versie is handig voor troubleshooting, scripting en als basis voor PowerShell op Linux.
+
+Syntax:
+```PowerShell
+LDWin-cli.ps1 [[-Interface] <string>] [[-TimeoutSeconds] <int>] [[-TcpdumpPath] <string>] [-ListInterfaces] [-Raw] [<CommonParameters>]
+```
+
 
 Toon beschikbare interfaces inclusief IP-adres, linkstatus, MAC-adres en omschrijving:
 
